@@ -3,7 +3,7 @@
 # Taller PCA + MCA (Tarea 1 y Tarea 2)
 # - Tarea 1: PCA (numéricas) + MCA (categóricas), umbral 80%
 # - Tarea 2: Selección de variables (f_classif / chi2) -> PCA/MCA, umbral 80%
-# - Mapping de diagnósticos OPCIONAL (sidebar o archivo local)
+# - Mapping de diagnósticos OPCIONAL (archivo local IDS_mapping.csv)
 # - Descarga del dataset final (PCs + Dimensiones)
 # ------------------------------------------------------------
 
@@ -45,14 +45,12 @@ def apply_diag_mapping(df_in: pd.DataFrame, ids_map: pd.DataFrame | None) -> pd.
     col_code = next((c for c in code_candidates if c in ids_map.columns), None)
     col_group = next((c for c in group_candidates if c in ids_map.columns), None)
     if col_code is None or col_group is None:
-        st.warning("IDS_mapping.csv no tiene columnas esperadas (p. ej., 'code' y 'group'). Se omite el mapeo.")
         return df_in
     mapping = ids_map.set_index(col_code)[col_group].to_dict()
     df = df_in.copy()
     for col in ["diag_1", "diag_2", "diag_3"]:
         if col in df.columns:
             df[col] = df[col].astype(str).map(mapping).fillna(df[col].astype(str))
-    st.info("Mapping de diagnósticos aplicado.")
     return df
 
 def split_numeric_categorical(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -160,7 +158,7 @@ def select_categorical_by_chi2(df: pd.DataFrame, y, target_col: str, threshold: 
     cat_cols = [c for c in cat_cols_all if c != target_col]
     if len(cat_cols) == 0:
         return [], np.array([])
-    # Codificación label por columna (como en el notebook)
+    # Codificación label por columna
     df_enc = df[cat_cols].fillna("NA").astype(str).apply(lambda s: LabelEncoder().fit_transform(s))
     sel = SelectKBest(score_func=chi2, k="all").fit(df_enc, y)
     scores = sel.scores_
@@ -180,8 +178,7 @@ def pca_on_selected(df: pd.DataFrame, cols: List[str], threshold: float = 0.80):
     pca = PCA().fit(Xs)
     cum = np.cumsum(pca.explained_variance_ratio_)
     n = int(np.searchsorted(cum, threshold) + 1)
-    pcs = pd.DataFrame(pca.transform(Xs)[:, :n],
-                       index=df.index,
+    pcs = pd.DataFrame(pca.transform(Xs)[:, :n], index=df.index,
                        columns=[f"PC{i+1}" for i in range(n)])
     return pcs, cum
 
@@ -190,7 +187,6 @@ def mca_on_selected(df: pd.DataFrame, cols: List[str], threshold: float = 0.80,
                     reduce_cardinality: bool = True):
     """MCA sobre columnas categóricas seleccionadas (si ≥2); si no, devuelve vacío."""
     if len(cols) < 2:
-        # En el cuaderno se anota que si queda 1 variable categórica, no se aplica MCA.
         return pd.DataFrame(index=df.index), np.array([])
     cat = df[cols].copy()
     dims, mca_model, cum_inertia = fit_mca(
@@ -205,46 +201,30 @@ def mca_on_selected(df: pd.DataFrame, cols: List[str], threshold: float = 0.80,
 
 st.set_page_config(page_title="Taller PCA + MCA | Tarea 1 y 2", layout="wide")
 
-st.title("Taller PCA + MCA — Tarea 1 y Tarea 2")
+st.title("Taller PCA + MCA — **Tarea 1** y **Tarea 2**")
 st.markdown(
-    "Este aplicativo permite ejecutar los **dos puntos** del taller:\n"
     "- **Tarea 1:** PCA (numéricas) + MCA (categóricas) y concatenar (umbral ≥ 80%).\n"
-    "- **Tarea 2:** Primero **selección de variables** (ANOVA F para numéricas, χ² para categóricas), "
-    "luego PCA/MCA y concatenar (umbral ≥ 80%)."
+    "- **Tarea 2:** Selección de variables (ANOVA F / χ²) → PCA/MCA y concatenar (umbral ≥ 80%)."
 )
 
 with st.sidebar:
     st.header("⚙️ Configuración")
-    mode = st.selectbox("Modo del taller", ["Tarea 1 (PCA+MCA)", "Tarea 2 (Selección -> PCA/MCA)"])
+    mode = st.radio("Modo del taller", ["Tarea 1 (PCA+MCA)", "Tarea 2 (Selección → PCA/MCA)"], index=0)
     threshold = st.slider("Umbral acumulado", min_value=0.50, max_value=0.95, value=0.80, step=0.01)
-    reduce_flag = st.checkbox("Reducir cardinalidad en MCA (recomendado)", value=True)
+    reduce_flag = st.checkbox("Reducir cardinalidad en MCA", value=True)
     st.caption("Reducir cardinalidad (raras → 'OTHER') acelera MCA en datasets grandes.")
 
 # === Rutas base ===
 BASE_DIR = Path(__file__).resolve().parent
 
-# === Carga opcional del mapping desde sidebar o archivo local ===
+# === Cargar mapping local si existe (opcional) ===
 ids_map = None
-with st.sidebar:
-    st.subheader("Opcional: mapping de diagnósticos (IDS_mapping.csv)")
-    map_file = st.file_uploader("Sube IDS_mapping.csv", type=["csv"])
-
-    if map_file is not None:
-        try:
-            ids_map = pd.read_csv(map_file)
-            st.success("Mapping cargado desde la subida.")
-        except Exception as e:
-            st.warning(f"No se pudo leer el mapping subido: {e}")
-    else:
-        local_map = BASE_DIR / "IDS_mapping.csv"
-        if local_map.exists():
-            try:
-                ids_map = pd.read_csv(local_map)
-                st.success(f"Mapping cargado desde archivo local: {local_map.name}")
-            except Exception as e:
-                st.warning(f"No se pudo leer el mapping local: {e}")
-        else:
-            st.info("Sin mapping: la app continuará sin agrupar diagnósticos.")
+local_map = BASE_DIR / "IDS_mapping.csv"
+if local_map.exists():
+    try:
+        ids_map = pd.read_csv(local_map)
+    except Exception:
+        ids_map = None  # si no se puede leer, se omite sin romper
 
 # === Cargar dataset principal ===
 DATA_PATH = BASE_DIR / "diabetic_data.csv"
@@ -281,7 +261,7 @@ with c2:
 
 # ===== Modo Tarea 1 =====
 if mode.startswith("Tarea 1"):
-    st.header("Paso 3 (Tarea 1): PCA sobre numéricas")
+    st.header("**Tarea 1** — Paso 3: PCA sobre numéricas")
     pcs, pca_model, cum_var = fit_pca(num_df, threshold=threshold)
     if pcs.shape[1] == 0:
         st.warning("No se generaron PCs.")
@@ -290,7 +270,7 @@ if mode.startswith("Tarea 1"):
         st.line_chart(pd.DataFrame(cum_var, columns=["Varianza acumulada"]))
         st.dataframe(pcs.head(10), use_container_width=True)
 
-    st.header("Paso 4 (Tarea 1): MCA sobre categóricas")
+    st.header("**Tarea 1** — Paso 4: MCA sobre categóricas")
     try:
         dims, mca_model, cum_inertia = fit_mca(
             cat_df=cat_df,
@@ -308,7 +288,7 @@ if mode.startswith("Tarea 1"):
         st.exception(e)
         dims = pd.DataFrame(index=df.index)
 
-    st.header("Paso 5: Dataset final (PCs + Dimensiones)")
+    st.header("**Tarea 1** — Paso 5: Dataset final (PCs + Dimensiones)")
     out_df = pd.concat([pcs, dims], axis=1)
     st.success(f"Dataset final: {out_df.shape[0]} filas × {out_df.shape[1]} columnas")
     st.dataframe(out_df.head(50), use_container_width=True)
@@ -318,28 +298,26 @@ if mode.startswith("Tarea 1"):
 
 # ===== Modo Tarea 2 =====
 else:
-    st.header("Paso 3 (Tarea 2): Selección de variables")
-    # Target para selección (como en el notebook, por defecto 'readmitted')
-    target_candidates = [c for c in df_clean.columns if c in ("readmitted",)]
-    target_col = st.selectbox("Variable objetivo (para f_classif / chi2)", options=[*target_candidates, *df_clean.columns], index=0 if target_candidates else 0)
+    st.header("**Tarea 2** — Paso 3: Selección de variables")
+    # Target por defecto típico del dataset
+    default_target = "readmitted" if "readmitted" in df_clean.columns else df_clean.columns[-1]
+    target_col = st.selectbox("Variable objetivo (para f_classif / chi2)", options=list(df_clean.columns),
+                              index=list(df_clean.columns).index(default_target))
     y = df_clean[target_col]
     if y.dtype == "O":
         y = LabelEncoder().fit_transform(y.astype(str))
 
-    # Selección numérica
     selected_num, cum_num = select_numeric_by_f_classif(df_clean, y, threshold=threshold)
     st.write(f"Numéricas seleccionadas ({len(selected_num)}):", selected_num[:20], "..." if len(selected_num) > 20 else "")
     if len(cum_num) > 0:
         st.line_chart(pd.DataFrame(cum_num, columns=["% relevancia acumulada (num)"]))
 
-    # Selección categórica
     selected_cat, cum_cat = select_categorical_by_chi2(df_clean, y, target_col, threshold=threshold)
     st.write(f"Categóricas seleccionadas ({len(selected_cat)}):", selected_cat[:20], "..." if len(selected_cat) > 20 else "")
     if len(cum_cat) > 0:
         st.line_chart(pd.DataFrame(cum_cat, columns=["% relevancia acumulada (cat)"]))
 
-    st.header("Paso 4 (Tarea 2): PCA/MCA sobre variables seleccionadas")
-    # PCA en numéricas seleccionadas
+    st.header("**Tarea 2** — Paso 4: PCA/MCA sobre variables seleccionadas")
     pcs, cum_pca = pca_on_selected(df_clean, selected_num, threshold=threshold)
     if pcs.shape[1] == 0:
         st.warning("No se generaron PCs (selección numérica vacía).")
@@ -348,11 +326,10 @@ else:
         st.line_chart(pd.DataFrame(cum_pca, columns=["Varianza acumulada (PCA)"]))
         st.dataframe(pcs.head(10), use_container_width=True)
 
-    # MCA en categóricas seleccionadas (solo si ≥ 2)
     dims, cum_mca = mca_on_selected(df_clean, selected_cat, threshold=threshold,
                                     n_components=50, reduce_cardinality=reduce_flag)
     if dims.shape[1] == 0 and len(selected_cat) < 2:
-        st.info("⚠ Solo queda 1 (o 0) variable categórica seleccionada → MCA no aplicado (como en el cuaderno).")
+        st.info("⚠ Solo queda 1 (o 0) variable categórica seleccionada → MCA no aplicado (criterio del taller).")
     elif dims.shape[1] == 0:
         st.warning("No se generaron Dimensiones.")
     else:
@@ -360,7 +337,7 @@ else:
         st.line_chart(pd.DataFrame(cum_mca, columns=["Inercia acumulada (MCA)"]))
         st.dataframe(dims.head(10), use_container_width=True)
 
-    st.header("Paso 5: Dataset final (PCs + Dimensiones)")
+    st.header("**Tarea 2** — Paso 5: Dataset final (PCs + Dimensiones)")
     out_df = pd.concat([pcs, dims], axis=1)
     st.success(f"Dataset final: {out_df.shape[0]} filas × {out_df.shape[1]} columnas")
     st.dataframe(out_df.head(50), use_container_width=True)
@@ -369,5 +346,6 @@ else:
     st.download_button("⬇️ Descargar dataset (CSV)", buf, "dataset_pca_mca_selected.csv", "text/csv")
 
 st.markdown("---")
-st.caption("Basado en el taller: Tarea 1 (PCA+MCA) y Tarea 2 (selección → PCA/MCA) con umbral del 80%.")
+st.caption("Tarea 1 y Tarea 2 del taller con umbral por defecto del 80%.")
+
 
