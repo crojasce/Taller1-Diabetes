@@ -2,80 +2,136 @@
 # -----------------------------------------------
 # Tarea 1: PCA (numéricas) + MCA (categóricas)
 # Umbral por defecto: 0.80
+# Opcional: mapping de diagnósticos y reducción de cardinalidad
 # -----------------------------------------------
 
 import argparse
+from typing import Tuple, List
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 
-# 'prince' para MCA
 try:
-    import prince
+    from prince import MCA
 except Exception as e:
-    raise ImportError(
-        "Falta la librería 'prince' (para MCA). Instala: pip install prince"
-    ) from e
+    raise ImportError("Falta 'prince' (MCA). Instala: pip install prince") from e
 
 
-def pca_select(X_num: pd.DataFrame, threshold: float = 0.80):
-    """Estandariza, aplica PCA y retorna PCs (≥ umbral de varianza)."""
-    if X_num.shape[1] == 0:
-        return pd.DataFrame(index=X_num.index), np.array([])
-    scaler = StandardScaler()
-    Xs = scaler.fit_transform(X_num.fillna(0))
-    pca = PCA()
-    Xp = pca.fit_transform(Xs)
+# -------- Utils en línea con app.py --------
+def drop_identifier_like_columns(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
+    ids_reales = {"encounter_id", "patient_nbr"}
+    dropped = [c for c in df.columns if c in ids_reales]
+    return df.drop(columns=dropped, errors="ignore"), dropped
+
+def apply_diag_mapping(df_in: pd.DataFrame, ids_map: pd.DataFrame | None) -> pd.DataFrame:
+    if ids_map is None:
+        return df_in
+    code_candidates = ["code", "diag_code", "icd9", "ICD9", "ICD9_CODE"]
+    group_candidates = ["group", "category", "CCS", "ccs_group"]
+    col_code = next((c for c in code_candidates if c in ids_map.columns), None)
+    col_group = next((c for c in group_candidates if c in ids_map.columns), None)
+    if col_code is None or col_group is None:
+        return df_in
+    mapping = ids_map.set_index(col_code)[col_group].to_dict()
+    df = df_in.copy()
+    for col in ["diag_1", "diag_2", "diag_3"]:
+        if col in df.columns:
+            df[col] = df[col].astype(str).map(mapping).fillna(df[col].astype(str))
+    return df
+
+def split_numeric_categorical(df: pd.DataFrame):
+    num_df = df.select_dtypes(include=["number"]).copy()
+    cat_df = df.select_dtypes(exclude=["number"]).copy()
+    return num_df, cat_df
+
+def fit_pca(num_df: pd.DataFrame, threshold: float = 0.80):
+    if num_df.shape[1] == 0:
+        return pd.DataFrame(index=num_df.index), None, np.array([])
+    X = num_df.fillna(num_df.mean(numeric_only=True))
+    Xs = StandardScaler().fit_transform(X)
+    pca = PCA().fit(Xs)
     cum = np.cumsum(pca.explained_variance_ratio_)
-    n = int(np.argmax(cum >= threshold) + 1)
-    pcs = pd.DataFrame(Xp[:, :n], index=X_num.index,
+    n = int(np.searchsorted(cum, threshold) + 1)
+    pcs = pd.DataFrame(pca.transform(Xs)[:, :n], index=num_df.index,
                        columns=[f"PC{i+1}" for i in range(n)])
     return pcs, cum
 
+def reduce_categorical_cardinality(cat: pd.DataFrame, max_modalities_per_col=50, rare_min_count=30):
+    cat = cat.fillna("missing").astype(str).copy()
+    for c in cat.columns:
+        vc = cat[c].value_counts(dropna=False)
+        if len(vc) > max_modalities_per_col:
+            keep = set(vc.index[:max_modalities_per_col - 1])
+            cat[c] = np.where(cat[c].isin(keep), cat[c], "OTHER")
+            vc = cat[c].value_counts(dropna=False)
+        rare_vals = set(vc[vc < rare_min_count].index)
+        if rare_vals:
+            cat[c] = cat[c].where(~cat[c].isin(rare_vals), "OTHER")
+    return cat
 
-def mca_select(X_cat: pd.DataFrame, threshold: float = 0.80, random_state: int = 42):
-    """Convierte a string, aplica MCA y retorna dims (≥ umbral de inercia)."""
-    if X_cat.shape[1] == 0:
-        return pd.DataFrame(index=X_cat.index), np.array([])
-    Xc = X_cat.fillna("NA").astype(str)
+def safe_explained_inertia(mca) -> np.ndarray:
+    if hasattr(mca, "explained_inertia_"):
+        return np.asarray(mca.explained_inertia_, dtype=float)
+    if hasattr(mca, "eigenvalues_"):
+        ev = np.asarray(mca.eigenvalues_, dtype=float).ravel()
+        tot = ev.sum() or 1.0
+        return ev / tot
+    if hasattr(mca, "singular_values_"):
+        sv = np.asarray(mca.singular_values_, dtype=float).ravel()
+        ev = sv ** 2
+        tot = ev.sum() or 1.0
+        return ev / tot
+    raise AttributeError("No se pudo obtener inercia explicada de prince.MCA.")
 
-    mca = prince.MCA(n_components=Xc.shape[1], random_state=random_state)
-    mca = mca.fit(Xc)
-    coords = mca.transform(Xc)
-
-    # Inercia explicada (como en tu Colab: eigenvalues -> proporciones)
-    eigvals = np.asarray(mca.eigenvalues_, dtype=float).ravel()
-    ratios = eigvals / eigvals.sum() if eigvals.sum() else np.zeros_like(eigvals)
-    cum = np.cumsum(ratios)
-    n = int(np.argmax(cum >= threshold) + 1)
-
-    dims = pd.DataFrame(np.array(coords)[:, :n], index=Xc.index,
+def fit_mca(cat_df: pd.DataFrame, threshold: float = 0.80,
+            n_components: int = 50,
+            reduce_cardinality: bool = True,
+            max_modalities_per_col: int = 50,
+            rare_min_count: int = 30):
+    if cat_df.shape[1] == 0:
+        return pd.DataFrame(index=cat_df.index), np.array([])
+    cat = cat_df.fillna("missing").astype(str)
+    if reduce_cardinality:
+        cat = reduce_categorical_cardinality(cat, max_modalities_per_col, rare_min_count)
+    mca = MCA(n_components=n_components).fit(cat)
+    inertia = safe_explained_inertia(mca)
+    cum = np.cumsum(inertia)
+    n = int(np.searchsorted(cum, threshold) + 1)
+    n = min(n, len(inertia))
+    coords = mca.transform(cat)
+    n = min(n, coords.shape[1])
+    dims = pd.DataFrame(coords.iloc[:, :n].to_numpy(), index=cat.index,
                         columns=[f"Dim{i+1}" for i in range(n)])
     return dims, cum
 
 
-def main(input_csv: str, output_csv: str, threshold: float):
-    df = pd.read_csv(input_csv)
+def main(args):
+    df = pd.read_csv(args.input)
+    # IDs fuera
+    df, dropped = drop_identifier_like_columns(df)
+    # Mapping opcional
+    ids_map = pd.read_csv(args.mapping) if args.mapping and os.path.exists(args.mapping) else None
+    df = apply_diag_mapping(df, ids_map)
 
-    # Separa numéricas/categóricas (como en el notebook)
-    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    cat_cols = df.select_dtypes(exclude=[np.number]).columns.tolist()
-
-    X_num = df[num_cols]
-    X_cat = df[cat_cols]
-
-    pcs, cum_pca = pca_select(X_num, threshold=threshold)
-    dims, cum_mca = mca_select(X_cat, threshold=threshold)
-
+    num_df, cat_df = split_numeric_categorical(df)
+    pcs, cum_pca = fit_pca(num_df, threshold=args.threshold)
+    dims, cum_mca = fit_mca(
+        cat_df,
+        threshold=args.threshold,
+        n_components=args.n_components,
+        reduce_cardinality=args.reduce_cardinality,
+        max_modalities_per_col=args.max_modalities_per_col,
+        rare_min_count=args.rare_min_count
+    )
     out = pd.concat([pcs, dims], axis=1)
-    out.to_csv(output_csv, index=False)
+    out.to_csv(args.output, index=False)
 
-    print(f"Umbral: {threshold:.0%}")
-    print(f"PCA -> componentes retenidas: {pcs.shape[1]}")
-    print(f"MCA -> dimensiones retenidas: {dims.shape[1]}")
-    print(f"Dataset final guardado en: {output_csv}")
-    print(f"Forma final: {out.shape}")
+    print(f"IDs eliminados: {dropped}")
+    print(f"Umbral: {args.threshold:.0%}")
+    print(f"PCA -> componentes: {pcs.shape[1]}")
+    print(f"MCA -> dimensiones: {dims.shape[1]}")
+    print(f"Salida: {args.output}  |  Forma: {out.shape}")
 
 
 if __name__ == "__main__":
@@ -83,5 +139,11 @@ if __name__ == "__main__":
     ap.add_argument("--input", default="diabetic_data.csv")
     ap.add_argument("--output", default="dataset_pca_mca.csv")
     ap.add_argument("--threshold", type=float, default=0.80)
+    ap.add_argument("--mapping", type=str, default=None, help="Ruta a IDS_mapping.csv (opcional)")
+    ap.add_argument("--reduce-cardinality", action="store_true", help="Agrupar raras en 'OTHER' (recomendado)")
+    ap.add_argument("--max-modalities-per-col", type=int, default=50)
+    ap.add_argument("--rare-min-count", type=int, default=30)
+    ap.add_argument("--n-components", type=int, default=50)
     args = ap.parse_args()
-    main(args.input, args.output, args.threshold)
+    main(args)
+
